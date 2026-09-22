@@ -109,6 +109,7 @@ from flag_gems.fused.stage_deepseek_v4_mega_moe_inputs import (
 from flag_gems.fused.swiglu import dswiglu, swiglu
 from flag_gems.fused.top_k_per_row_decode import top_k_per_row_decode
 from flag_gems.fused.top_k_per_row_prefill import top_k_per_row_prefill
+from flag_gems.fused.top_k_top_p import apply_top_k_top_p
 from flag_gems.fused.topk_softmax import topk_softmax
 from flag_gems.fused.topk_softplus_sqrt import topk_softplus_sqrt
 from flag_gems.fused.unpack_seq import unpack_seq_triton
@@ -190,6 +191,7 @@ __all__ = [
     "swiglu",
     "top_k_per_row_decode",
     "top_k_per_row_prefill",
+    "apply_top_k_top_p",
     "topk_softmax",
     "topk_softplus_sqrt",
     "triton_sparse_mla_fwd_interface",
