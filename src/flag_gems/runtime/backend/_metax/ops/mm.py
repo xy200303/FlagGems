@@ -988,7 +988,7 @@ _NT_DB_SPLITK_MIN_K = 4096
 @libtuner(
     configs=[
         triton.Config(
-            {"BLOCK_M": bm, "BLOCK_N": bn, "BLOCK_K": bk},
+            {"BLOCK_M": bm, "BLOCK_N": bn, "BLOCK_K": bk, "GROUP_M": 8},
             num_stages=ns,
             num_warps=nw,
         )
@@ -998,6 +998,10 @@ _NT_DB_SPLITK_MIN_K = 4096
             (64, 64, 64, 2, 4),
             (128, 64, 128, 2, 4),
             (32, 64, 128, 2, 4),
+            (128, 128, 64, 2, 8),
+            (128, 128, 128, 2, 8),
+            (64, 256, 64, 2, 8),
+            (128, 256, 64, 2, 8),
         ]
     ],
     key=["M", "N", "K"],
@@ -1013,11 +1017,20 @@ def mm_kernel_nt_db(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
 ):
     pid = tl.program_id(0)
+    grid_m = tl.cdiv(M, BLOCK_M)
     grid_n = tl.cdiv(N, BLOCK_N)
-    pid_m = pid // grid_n
-    pid_n = pid % grid_n
+
+    # grouped rasterization (same as mm_kernel_nt) so CTAs in one M-group
+    # share B tiles in L2
+    width = GROUP_M * grid_n
+    group_id = pid // width
+    group_size = min(grid_m - group_id * GROUP_M, GROUP_M)
+    pid_m = group_id * GROUP_M + pid % group_size
+    pid_n = pid % width // group_size
+
     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     rk = tl.arange(0, BLOCK_K)
