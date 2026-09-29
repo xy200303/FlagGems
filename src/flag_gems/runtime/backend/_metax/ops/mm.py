@@ -28,6 +28,21 @@ from flag_gems.utils import triton_lang_extension as ext
 from flag_gems.utils.device_info import get_l2_cache_size, get_sm_count
 
 logger = logging.getLogger(__name__)
+
+# Runtime-autotune stall guard: bucket the autotune key for M coarsely so a new
+# batch composition does not trigger a multi-second compile+bench storm inside
+# execute_model (observed: single 23.8 s engine stall on a fresh key).
+from flag_gems.utils.libentry import LibTuner
+
+
+@LibTuner.register_strategy("align128")
+def _align128_strategy(key):
+    if key == 0:
+        return 0
+    if key < 128:
+        return 2 ** math.ceil(math.log2(key))
+    return math.ceil(key / 128) * 128
+
 EXPAND_CONFIG_FILENAME = os.path.normpath(
     os.path.join(os.path.dirname(__file__), "..", "mm_metax_expand.yaml")
 )
@@ -249,6 +264,7 @@ def mm_kernel(
 @libtuner(
     configs=runtime.get_tuned_config("mm_nn"),
     key=["M", "N", "K"],
+    strategy=["align128", "align32", "align32"],
     prune_configs_by={"early_config_prune": _prune_mm_dense_configs},
     flagtune_op_name="mm",
     flagtune_expand_op_name="mm_nn",
@@ -330,6 +346,7 @@ def mm_kernel_nn(
 @libtuner(
     configs=runtime.get_tuned_config("mm_nt"),
     key=["M", "N", "K"],
+    strategy=["align128", "align32", "align32"],
     prune_configs_by={"early_config_prune": _prune_mm_dense_configs_nt},
     flagtune_op_name="mm",
     flagtune_expand_op_name="mm_nt",
@@ -993,18 +1010,12 @@ _NT_DB_SPLITK_MIN_K = 4096
             num_warps=nw,
         )
         for bm, bn, bk, ns, nw in [
-            (64, 64, 128, 2, 4),
-            (64, 128, 128, 2, 4),
-            (64, 64, 64, 2, 4),
-            (128, 64, 128, 2, 4),
-            (32, 64, 128, 2, 4),
-            (128, 128, 64, 2, 8),
-            (128, 128, 128, 2, 8),
-            (64, 256, 64, 2, 8),
-            (128, 256, 64, 2, 8),
+            (64, 64, 128, 2, 4),  # measured best at decode shapes; single config
+                                  # => libtuner never autotunes at runtime
         ]
     ],
     key=["M", "N", "K"],
+    strategy=["align128", "align32", "align32"],
 )
 @triton.jit
 def mm_kernel_nt_db(
@@ -1062,13 +1073,9 @@ def mm_kernel_nt_db(
             num_stages=2,
             num_warps=4,
         ),
-        triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 256},
-            num_stages=2,
-            num_warps=4,
-        ),
     ],
     key=["M", "N", "K"],
+    strategy=["align128", "align32", "align32"],
 )
 @triton.jit
 def mm_kernel_nt_db_splitk_partial(
