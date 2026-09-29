@@ -1186,6 +1186,211 @@ def _select_nt_db(a, b, c, M, N, K):
     return nt_db_mm
 
 
+# ---------------------------------------------------------------------------
+# nn-layout variants of the double-buffered skinny-M kernels above, for
+# deployments that repack weights to [K,N] once and want a single layout for
+# both prefill and decode.  Measured on C500 at M=64 (swept configs):
+# qkv 57.6us / o_proj 55.9us / gate_up 90.0us vs nt_db 58/58/72us — on par.
+# NOTE: the config matters enormously on this backend; num_warps=4 variants
+# were 6-10x slower.  Do not pin num_warps=4 here.
+# ---------------------------------------------------------------------------
+
+
+@libentry()
+@libtuner(
+    configs=[
+        triton.Config(
+            {"BLOCK_M": bm, "BLOCK_N": bn, "BLOCK_K": bk, "GROUP_M": 8},
+            num_stages=ns,
+            num_warps=nw,
+        )
+        for bm, bn, bk, ns, nw in [
+            (64, 32, 128, 2, 8),   # swept best for qkv/o_proj (more CTAs on 104 SMs)
+            (64, 32, 128, 3, 8),   # swept best for qkv (deeper pipeline)
+            (64, 128, 128, 2, 8),
+            (64, 64, 64, 2, 8),    # swept best for gate_up (N=12288)
+        ]
+    ],
+    key=["M", "N", "K"],
+    strategy=["align128", "align32", "align32"],
+)
+@triton.jit
+def mm_kernel_nn_db(
+    A,
+    B,
+    C,
+    M,
+    N,
+    K,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    grid_m = tl.cdiv(M, BLOCK_M)
+    grid_n = tl.cdiv(N, BLOCK_N)
+
+    width = GROUP_M * grid_n
+    group_id = pid // width
+    group_size = min(grid_m - group_id * GROUP_M, GROUP_M)
+    pid_m = group_id * GROUP_M + pid % group_size
+    pid_n = pid % width // group_size
+
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    rk = tl.arange(0, BLOCK_K)
+    a_ptrs = A + rm[:, None] * K + rk[None, :]
+    b_ptrs = B + rk[:, None] * N + rn[None, :]  # B is [K, N] row-major
+
+    a = tl.load(a_ptrs, mask=rm[:, None] < M, other=0.0)
+    b = tl.load(b_ptrs, mask=rn[None, :] < N, other=0.0)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for _ in range(tl.cdiv(K, BLOCK_K) - 1):
+        a_ptrs += BLOCK_K
+        b_ptrs += BLOCK_K * N
+        a_next = tl.load(a_ptrs, mask=rm[:, None] < M, other=0.0)
+        b_next = tl.load(b_ptrs, mask=rn[None, :] < N, other=0.0)
+        acc = tl.dot(a, b, acc, out_dtype=tl.float32)
+        a = a_next
+        b = b_next
+    acc = tl.dot(a, b, acc, out_dtype=tl.float32)
+    c_ptrs = C + rm[:, None] * N + rn[None, :]
+    mask = (rm < M)[:, None] & (rn < N)[None, :]
+    tl.store(c_ptrs, acc.to(C.dtype.element_ty), mask=mask)
+
+
+@libentry()
+@libtuner(
+    configs=[
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 128},
+            num_stages=2,
+            num_warps=8,
+        ),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 32, "BLOCK_K": 128},
+            num_stages=2,
+            num_warps=8,
+        ),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 128},
+            num_stages=2,
+            num_warps=8,
+        ),
+    ],
+    key=["M", "N", "K"],
+    strategy=["align128", "align32", "align32"],
+)
+@triton.jit
+def mm_kernel_nn_db_splitk_partial(
+    A,
+    B,
+    P,
+    M,
+    N,
+    K,
+    SPLIT_K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    grid_n = tl.cdiv(N, BLOCK_N)
+    pid_m = pid // grid_n
+    pid_n = pid % grid_n
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    rk = tl.arange(0, BLOCK_K)
+
+    total_iters = tl.cdiv(K, BLOCK_K)
+    per_split = tl.cdiv(total_iters, SPLIT_K)
+    it_lo = pid_k * per_split
+    it_hi = min((pid_k + 1) * per_split, total_iters)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    if it_lo < it_hi:
+        a_ptrs = A + rm[:, None] * K + it_lo * BLOCK_K + rk[None, :]
+        b_ptrs = B + (it_lo * BLOCK_K + rk[:, None]) * N + rn[None, :]
+        a = tl.load(a_ptrs, mask=rm[:, None] < M, other=0.0)
+        b = tl.load(b_ptrs, mask=rn[None, :] < N, other=0.0)
+        for _ in range(it_hi - it_lo - 1):
+            a_ptrs += BLOCK_K
+            b_ptrs += BLOCK_K * N
+            a_next = tl.load(a_ptrs, mask=rm[:, None] < M, other=0.0)
+            b_next = tl.load(b_ptrs, mask=rn[None, :] < N, other=0.0)
+            acc = tl.dot(a, b, acc, out_dtype=tl.float32)
+            a = a_next
+            b = b_next
+        acc = tl.dot(a, b, acc, out_dtype=tl.float32)
+
+    p_ptrs = P + pid_k * M * N + rm[:, None] * N + rn[None, :]
+    mask = (rm < M)[:, None] & (rn < N)[None, :]
+    tl.store(p_ptrs, acc, mask=mask)
+
+
+def nn_db_mm(a, b, c, M, N, K):
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
+    )
+    with torch_device_fn.device(a.device):
+        mm_kernel_nn_db[grid](a, b, c, M, N, K)
+    return c
+
+
+def nn_db_splitk_mm(a, b, c, M, N, K):
+    split_k = 4 if K < 8192 else 8
+    partials = torch.empty((split_k, M, N), device=a.device, dtype=torch.float32)
+    partial_grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
+        split_k,
+    )
+    reduce_block_size = 256
+    reduce_grid = (triton.cdiv(M * N, reduce_block_size),)
+    with torch_device_fn.device(a.device):
+        mm_kernel_nn_db_splitk_partial[partial_grid](
+            a, b, partials, M, N, K, SPLIT_K=split_k
+        )
+        mm_kernel_splitk_reduce[reduce_grid](
+            partials,
+            c,
+            M,
+            N,
+            c.stride(0),
+            c.stride(1),
+            SPLIT_K=split_k,
+            BLOCK_SIZE=reduce_block_size,
+            num_warps=4,
+        )
+    return c
+
+
+def _nn_db_scenario(a, b, c, M, N, K):
+    return (
+        0 < M <= _NT_DB_MAX_M
+        and 512 <= N <= _NT_DB_MAX_N
+        and K >= _NT_DB_MIN_K
+        and K % 128 == 0
+        and a.dtype == b.dtype == c.dtype
+        and a.dtype in (torch.float16, torch.bfloat16)
+        and a.stride(0) == K
+        and a.stride(1) == 1
+        and b.stride(0) == N
+        and b.stride(1) == 1
+        and c.stride(0) == N
+        and c.stride(1) == 1
+    )
+
+
+def _select_nn_db(a, b, c, M, N, K):
+    if not _nn_db_scenario(a, b, c, M, N, K):
+        return None
+    if K >= _NT_DB_SPLITK_MIN_K:
+        return nn_db_splitk_mm
+    return nn_db_mm
+
+
 def general_mm(a, b, c, M, N, K):
     dot_out_dtype = tl.float32
     grid = lambda META: (
@@ -1400,15 +1605,20 @@ def mm(a, b):
         if _gemv_k_parallel_scenario(M, K):
             return gemv_mm_k_parallel(a, b, c, M, K)
         return gemv_mm(a, b, c, M, K)
+    # double-buffered skinny-M kernels must run before the generic split-K
+    # scenarios: they cover the same shapes but are 2-6x faster on this backend.
+    nt_db = _select_nt_db(a, b, c, M, N, K)
+    if nt_db is not None:
+        return nt_db(a, b, c, M, N, K)
+    nn_db = _select_nn_db(a, b, c, M, N, K)
+    if nn_db is not None:
+        return nn_db(a, b, c, M, N, K)
     two_step_split_k = _select_two_step_split_k(M, N, K)
     if two_step_split_k is not None:
         return splitk_mm_two_step(a, b, c, M, N, K, two_step_split_k)
     if splitk_mm_scenario(M, N, K):
         c.zero_()
         return splitk_mm(a, b, c, M, N, K)
-    nt_db = _select_nt_db(a, b, c, M, N, K)
-    if nt_db is not None:
-        return nt_db(a, b, c, M, N, K)
     if nn_mm_scenario(a, b, c, M, N, K):
         return general_mm_nn(a, b, c, M, N, K)
     if nt_mm_scenario(a, b, c, M, N, K):
@@ -1433,15 +1643,18 @@ def mm_out(a, b, *, out):
         if _gemv_k_parallel_scenario(M, K):
             return gemv_mm_k_parallel(a, b, c, M, K)
         return gemv_mm(a, b, c, M, K)
+    nt_db = _select_nt_db(a, b, c, M, N, K)
+    if nt_db is not None:
+        return nt_db(a, b, c, M, N, K)
+    nn_db = _select_nn_db(a, b, c, M, N, K)
+    if nn_db is not None:
+        return nn_db(a, b, c, M, N, K)
     two_step_split_k = _select_two_step_split_k(M, N, K)
     if two_step_split_k is not None:
         return splitk_mm_two_step(a, b, out, M, N, K, two_step_split_k)
     if splitk_mm_scenario(M, N, K):
         c.zero_()
         return splitk_mm(a, b, c, M, N, K)
-    nt_db = _select_nt_db(a, b, c, M, N, K)
-    if nt_db is not None:
-        return nt_db(a, b, c, M, N, K)
     if nn_mm_scenario(a, b, c, M, N, K):
         return general_mm_nn(a, b, c, M, N, K)
     if nt_mm_scenario(a, b, c, M, N, K):
