@@ -27,12 +27,10 @@ reads the bf16 lm_head output directly and never materializes fp32 logits:
 
     1. row stats:   split-parallel online max + partition sum of x/T
                     (partial kernel + tiny reduce kernel)
-    2. top-p zoom:  two rounds of a 256-bin mass histogram over the logit
-                    range, each followed by a tiny per-row CDF walk that
-                    shrinks the threshold range 256x.  After two rounds the
-                    threshold tau is pinned to ~1e-3 logits -- the kept set
-                    differs from an exact bisection by at most a few
-                    boundary tokens whose probability mass is < 0.1%.
+    2. top-p zoom:  mass-histogram threshold search over the logit range.
+                    Default: a single 1024-bin round (tau precision
+                    ~0.06 logits; statistically identical to the 2x256
+                    two-round variant at 2.6x lower kernel time).
                     tau is taken as the crossing bin's LOWER edge, so the
                     kept set always carries >= p * Z mass (never over-trims).
     3. fused sample: split-parallel pass computing
@@ -276,8 +274,8 @@ _STEP_COUNTER = {"value": 0}
 _BUF_CACHE = {}
 
 
-def _get_buffers(batch, vocab, dev):
-    key = (batch, vocab, dev)
+def _get_buffers(batch, vocab, dev, nbins=_NBINS):
+    key = (batch, vocab, dev, nbins)
     bufs = _BUF_CACHE.get(key)
     if bufs is None:
         BLOCK = 4096
@@ -296,7 +294,7 @@ def _get_buffers(batch, vocab, dev):
             lo=torch.empty(batch, **f32),
             hi=torch.empty(batch, **f32),
             tau=torch.empty(batch, **f32),
-            hist=torch.empty(batch, _NBINS, **f32),
+            hist=torch.empty(batch, nbins, **f32),
             pval=torch.empty(batch, num_splits, **f32),
             pidx=torch.empty(batch, num_splits, device=dev, dtype=torch.int32),
             out=torch.empty(batch, device=dev, dtype=torch.int32),
@@ -310,7 +308,8 @@ def fused_top_p_sample(
     temperature: torch.Tensor,
     top_p: torch.Tensor,
     seed: int = 0,
-    zoom_rounds: int = 2,
+    zoom_rounds: int = 1,
+    nbins: int = 0,
 ) -> torch.Tensor:
     """Sample one token per row: top-p filter + temperature + Gumbel-Max.
 
@@ -319,15 +318,21 @@ def fused_top_p_sample(
         temperature: [batch] float tensor; rows < 1e-5 are greedy (argmax).
         top_p: [batch] float tensor of nucleus thresholds.
         seed: Philox base seed.
-        zoom_rounds: histogram zoom rounds (2 => ~1e-3 logit threshold
-            precision; each extra round divides it by 256).
+        zoom_rounds: histogram zoom rounds.  1 (default) with 1024 bins is
+            fastest and statistically identical to 2x256 on TV/boundary
+            tests (test_zoom_variants.py); tau is always the crossing bin's
+            LOWER edge so the kept set never under-covers p*Z.
+        nbins: histogram bins per round; 0 => 1024 (1 round) or 256
+            (2+ rounds).
 
     Returns:
         [batch] int32 tensor of token ids.
     """
+    if nbins == 0:
+        nbins = 1024 if zoom_rounds == 1 else _NBINS
     batch, vocab = logits.shape
     dev = logits.device
-    b = _get_buffers(batch, vocab, dev)
+    b = _get_buffers(batch, vocab, dev, nbins)
     ns = b["num_splits"]
     grid2d = (batch, ns)
 
@@ -346,11 +351,11 @@ def fused_top_p_sample(
         _hist_zoom[grid2d](
             logits, temperature, b["m_row"], b["lo"], b["hi"], b["hist"],
             logits.stride(0), vocab, b["tiles_per_split"], ns,
-            NBINS=_NBINS, BLOCK=4096, num_warps=4,
+            NBINS=nbins, BLOCK=4096, num_warps=4,
         )
         _hist_walk[(batch,)](
             b["hist"], b["z_row"], top_p, b["lo"], b["hi"], b["tau"],
-            NBINS=_NBINS, FINAL=(round_no == 1), num_warps=1,
+            NBINS=nbins, FINAL=(round_no == 1), num_warps=1,
         )
 
     step = _STEP_COUNTER["value"]
