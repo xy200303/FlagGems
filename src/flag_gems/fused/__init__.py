@@ -200,3 +200,4 @@ __all__ = [
     "unpack_seq_triton",
     "weight_norm",
 ]
+from flag_gems.fused.paged_decode_attention import paged_decode_attention
