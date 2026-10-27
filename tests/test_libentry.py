@@ -1893,3 +1893,4 @@ def test_sql_model_loads_requested_table(tmp_path):
     assert model.__table__.name == "wanted"
     with sqlalchemy.orm.Session(engine) as session:
         assert session.get(model, {"key_0": 64}).num_warps == 4
+    assert SQLPersistantModel.build_sql_model_by_db("missing", engine) is None
