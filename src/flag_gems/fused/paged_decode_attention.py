@@ -198,6 +198,73 @@ def _segment_kernel_paged(
 
 
 @triton.jit
+def _segment_kernel_paged_split(
+    Q, K, V, SEG_ACC, SEG_MAX, SEG_SUM, BT, SEQ_LEN,
+    stride_qb, stride_qh, stride_qd,
+    stride_kb, stride_ks, stride_kh, stride_kd,
+    stride_vb, stride_vs, stride_vh, stride_vd,
+    stride_btb, stride_btp,
+    HQ: tl.constexpr, HKV: tl.constexpr, D: tl.constexpr, BS: tl.constexpr,
+    GQA: tl.constexpr, NSEG: tl.constexpr, scale,
+):
+    pid_g = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    pid_s = tl.program_id(2)
+
+    offs_d = tl.arange(0, D)
+    offs_g = tl.arange(0, GQA)
+    kvlen = tl.load(SEQ_LEN + pid_s)
+    units = (kvlen + NSEG * BS - 1) // (NSEG * BS)
+    start = pid_g * units * BS
+    end = tl.minimum(start + units * BS, kvlen)
+    main_end = start + (end - start) // BS * BS
+
+    m_i = tl.full((GQA,), float("-inf"), dtype=tl.float32)
+    l_i = tl.zeros((GQA,), dtype=tl.float32)
+    acc = tl.zeros((GQA, D), dtype=tl.float32)
+
+    qv = tl.load(Q + pid_s * stride_qb + (pid_h * GQA + offs_g)[:, None] * stride_qh
+                 + offs_d[None, :] * stride_qd)
+    pos = tl.arange(0, BS)
+
+    for t0 in range(start, main_end, BS):
+        page = tl.load(BT + pid_s * stride_btb + (t0 // BS) * stride_btp)
+        kt = tl.load(K + page * stride_kb + pos[None, :] * stride_ks
+                     + pid_h * stride_kh + offs_d[:, None] * stride_kd)
+        vt = tl.load(V + page * stride_vb + pos[:, None] * stride_vs
+                     + pid_h * stride_vh + offs_d[None, :] * stride_vd)
+        s = tl.dot(qv, kt) * scale
+        m_new = tl.maximum(m_i, tl.max(s, 1))
+        alpha = tl.exp2(m_i - m_new)
+        p = tl.exp2(s - m_new[:, None])
+        l_i = l_i * alpha + tl.sum(p, 1)
+        acc = acc * alpha[:, None] + tl.dot(p.to(vt.dtype), vt)
+        m_i = m_new
+
+    if main_end < end:
+        page = tl.load(BT + pid_s * stride_btb + (main_end // BS) * stride_btp)
+        mask_t = main_end + pos < kvlen
+        kt = tl.load(K + page * stride_kb + pos[None, :] * stride_ks
+                     + pid_h * stride_kh + offs_d[:, None] * stride_kd,
+                     mask=mask_t[None, :], other=0.0)
+        vt = tl.load(V + page * stride_vb + pos[:, None] * stride_vs
+                     + pid_h * stride_vh + offs_d[None, :] * stride_vd,
+                     mask=mask_t[:, None], other=0.0)
+        s = tl.where(mask_t[None, :], tl.dot(qv, kt) * scale, float("-inf"))
+        m_new = tl.maximum(m_i, tl.max(s, 1))
+        alpha = tl.exp2(m_i - m_new)
+        p = tl.exp2(s - m_new[:, None])
+        l_i = l_i * alpha + tl.sum(p, 1)
+        acc = acc * alpha[:, None] + tl.dot(p.to(vt.dtype), vt)
+        m_i = m_new
+
+    base = (pid_s * HKV + pid_h) * NSEG + pid_g
+    tl.store(SEG_MAX + base * GQA + offs_g, m_i)
+    tl.store(SEG_SUM + base * GQA + offs_g, l_i)
+    tl.store(SEG_ACC + (base * GQA + offs_g)[:, None] * D + offs_d[None, :], acc)
+
+
+@triton.jit
 def _combine_kernel(
     SEG_ACC, SEG_MAX, SEG_SUM, OUT,
     stride_ob, stride_oh, stride_od,
@@ -236,6 +303,7 @@ def paged_decode_attention(
     num_warps: int = 1,
     num_stages: int = 1,
     seg_buffers=None,
+    split_tail: bool = False,
 ):
     """Decode-step attention over a paged KV cache.
 
@@ -251,6 +319,8 @@ def paged_decode_attention(
             compile time so the grid is shape-static (CUDA-graph friendly).
         seg_buffers: ``(acc, max, sum)`` scratch.  Pass preallocated tensors when
             calling from inside a CUDA graph; ``None`` allocates per call.
+        split_tail: use the experimental full-page loop with a separate ragged
+            tail.  Only valid when ``block_n == block_size``.
 
     Returns:
         The scratch buffers, so callers can reuse them across launches.
@@ -278,7 +348,11 @@ def paged_decode_attention(
         HQ=num_q_heads, HKV=num_kv_heads, D=head_dim, BS=block_size, GQA=gqa,
         scale=scale * LOG2E, num_warps=num_warps, num_stages=num_stages,
     )
-    if block_n == block_size:
+    if block_n == block_size and split_tail:
+        _segment_kernel_paged_split[(num_segments, num_kv_heads, num_seqs)](
+            q, k_cache, v_cache, seg_acc, seg_max, seg_sum, block_table,
+            seq_lens, NSEG=num_segments, **common)
+    elif block_n == block_size:
         _segment_kernel_paged[(num_segments, num_kv_heads, num_seqs)](
             q, k_cache, v_cache, seg_acc, seg_max, seg_sum, block_table,
             seq_lens, NSEG=num_segments, **common)
