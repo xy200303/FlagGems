@@ -145,7 +145,8 @@ class SQLPersistantModel(PersistantModel):
         AutoBase: sqlalchemy.ext.automap.AutomapBase = (
             sqlalchemy.ext.automap.automap_base()
         )
-        AutoBase.prepare(engine)
+        sqlalchemy.Table(name, AutoBase.metadata, autoload_with=engine)
+        AutoBase.prepare()
         ModelCls: Optional[Type[Base]] = AutoBase.classes.get(name)
         return ModelCls
 
