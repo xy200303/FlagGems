@@ -120,3 +120,32 @@ def test_paged_decode_attention_batch_invariant():
         for row, seq in enumerate(idx):
             utils.gems_assert_equal(out[row], full[seq])
             utils.gems_assert_equal(back[row], out[row])
+
+
+@pytest.mark.paged_decode_attention
+def test_paged_decode_attention_unroll2():
+    device = flag_gems.device
+    dtype = torch.bfloat16
+    B, max_kv = 8, 4096
+    torch.manual_seed(3)
+    nblk = max_kv // BS
+    k_cache, v_cache = _make_cache(B * nblk, dtype, device)
+    block_table = torch.arange(B * nblk, dtype=torch.int32,
+                               device=device).view(B, nblk).contiguous()
+    lens = torch.tensor([1, 15, 16, 17, 255, 256, 257, 4095],
+                        dtype=torch.int32, device=device)
+    q = torch.randn(B, HQ, D, dtype=dtype, device=device)
+    scale = D ** -0.5
+    current = torch.empty_like(q)
+    unrolled = torch.empty_like(q)
+
+    common = dict(num_segments=32, block_n=BS, num_warps=1)
+    paged_decode_attention(q, k_cache, v_cache, current, block_table, lens,
+                           scale, **common)
+    paged_decode_attention(q, k_cache, v_cache, unrolled, block_table, lens,
+                           scale, unroll_pages=2, **common)
+    torch.cuda.synchronize()
+
+    ref = _ref(q, k_cache, v_cache, block_table, lens, scale)
+    utils.gems_assert_equal(unrolled, current)
+    utils.gems_assert_close(unrolled, ref, dtype, atol=2e-2)
