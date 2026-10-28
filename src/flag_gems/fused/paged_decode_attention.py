@@ -166,24 +166,31 @@ def _segment_kernel_paged(
                  + offs_d[None, :] * stride_qd)
     pos = tl.arange(0, BS)
 
-    for t0 in range(start, end, BS):
+    main_end = start + (end - start) // BS * BS
+    for t0 in range(start, main_end, BS):
         page = tl.load(BT + pid_s * stride_btb + (t0 // BS) * stride_btp)
-        if t0 + BS <= kvlen:
-            kt = tl.load(K + page * stride_kb + pos[None, :] * stride_ks
-                         + pid_h * stride_kh + offs_d[:, None] * stride_kd)
-            vt = tl.load(V + page * stride_vb + pos[:, None] * stride_vs
-                         + pid_h * stride_vh + offs_d[None, :] * stride_vd)
-            s = tl.dot(qv, kt) * scale
-        else:
-            mask_t = t0 + pos < kvlen
-            kt = tl.load(K + page * stride_kb + pos[None, :] * stride_ks
-                         + pid_h * stride_kh + offs_d[:, None] * stride_kd,
-                         mask=mask_t[None, :], other=0.0)
-            vt = tl.load(V + page * stride_vb + pos[:, None] * stride_vs
-                         + pid_h * stride_vh + offs_d[None, :] * stride_vd,
-                         mask=mask_t[:, None], other=0.0)
-            s = tl.where(mask_t[None, :], tl.dot(qv, kt) * scale,
-                         float("-inf"))
+        kt = tl.load(K + page * stride_kb + pos[None, :] * stride_ks
+                     + pid_h * stride_kh + offs_d[:, None] * stride_kd)
+        vt = tl.load(V + page * stride_vb + pos[:, None] * stride_vs
+                     + pid_h * stride_vh + offs_d[None, :] * stride_vd)
+        s = tl.dot(qv, kt) * scale
+        m_new = tl.maximum(m_i, tl.max(s, 1))
+        alpha = tl.exp2(m_i - m_new)
+        p = tl.exp2(s - m_new[:, None])
+        l_i = l_i * alpha + tl.sum(p, 1)
+        acc = acc * alpha[:, None] + tl.dot(p.to(vt.dtype), vt)
+        m_i = m_new
+
+    if main_end < end:
+        page = tl.load(BT + pid_s * stride_btb + (main_end // BS) * stride_btp)
+        mask_t = main_end + pos < kvlen
+        kt = tl.load(K + page * stride_kb + pos[None, :] * stride_ks
+                     + pid_h * stride_kh + offs_d[:, None] * stride_kd,
+                     mask=mask_t[None, :], other=0.0)
+        vt = tl.load(V + page * stride_vb + pos[:, None] * stride_vs
+                     + pid_h * stride_vh + offs_d[None, :] * stride_vd,
+                     mask=mask_t[:, None], other=0.0)
+        s = tl.where(mask_t[None, :], tl.dot(qv, kt) * scale, float("-inf"))
         m_new = tl.maximum(m_i, tl.max(s, 1))
         alpha = tl.exp2(m_i - m_new)
         p = tl.exp2(s - m_new[:, None])
