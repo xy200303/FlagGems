@@ -1894,3 +1894,25 @@ def test_sql_model_loads_requested_table(tmp_path):
     with sqlalchemy.orm.Session(engine) as session:
         assert session.get(model, {"key_0": 64}).num_warps == 4
     assert SQLPersistantModel.build_sql_model_by_db("missing", engine) is None
+
+
+def test_libentry_key_preserves_tensor_and_integer_specialization():
+    tensor = torch.empty(16, dtype=torch.float32)
+    entry = softmax_kernel_inner
+    key = entry.key(
+        [tensor, 0, 2**31],
+        [tensor, -(2**31) - 1, 2**63, 2**64],
+        [32, True],
+    )
+    assert key == (
+        (tensor.dtype, tensor.data_ptr() % entry.divisibility == 0),
+        (int, 0),
+        (int, 2**31),
+        tensor.dtype,
+        "i64",
+        "u64",
+        "i64",
+        32,
+        True,
+    )
+    assert entry.param_names == tuple(entry.signature.parameters)
