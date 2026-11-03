@@ -13,11 +13,13 @@
 # limitations under the License.
 
 from .matmul_bias_activation import matmul_bias_activation
+from .mm_silu_mul import mm_silu_mul
 from .sparse_attention import sparse_attn_triton
 from .top_k_per_row_prefill import top_k_per_row_prefill
 
 __all__ = [
     "matmul_bias_activation",
+    "mm_silu_mul",
     "sparse_attn_triton",
     "top_k_per_row_prefill",
 ]
