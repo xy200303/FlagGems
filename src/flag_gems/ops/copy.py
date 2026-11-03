@@ -17,8 +17,9 @@ from typing import Optional
 
 import torch
 import triton
+import triton.language as tl
 
-from flag_gems.utils import pointwise_dynamic
+from flag_gems.utils import libentry, pointwise_dynamic
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,14 @@ _FLOAT8_E8M0FNU = getattr(torch, "float8_e8m0fnu", None)
 @triton.jit
 def _copy_kernel(src):
     return src
+
+
+@libentry()
+@triton.jit
+def _copy_contiguous_kernel(dst, src, n, BLOCK: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    tl.store(dst + offsets, tl.load(src + offsets, mask=mask), mask=mask)
 
 
 def _can_use_triton(dst: torch.Tensor, src: torch.Tensor) -> bool:
@@ -124,6 +133,16 @@ def copy_(dst: torch.Tensor, src: torch.Tensor, non_blocking: bool = False):
         )
 
     logger.debug("GEMS COPY_")
+
+    if (
+        dst.dtype == src.dtype
+        and dst.shape == src.shape
+        and dst.is_contiguous()
+        and src.is_contiguous()
+    ):
+        n = dst.numel()
+        _copy_contiguous_kernel[(triton.cdiv(n, 1024),)](dst, src, n, BLOCK=1024)
+        return dst
 
     try:
         broadcast_shape = torch.broadcast_shapes(dst.shape, src.shape)
