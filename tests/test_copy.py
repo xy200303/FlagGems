@@ -293,3 +293,19 @@ def test_copy_functional_broadcast():
         res_out = torch.ops.aten.copy(template, src)
 
     utils.gems_assert_equal(res_out, ref_out)
+
+
+@pytest.mark.copy_
+def test_copy_inplace_noncontiguous_same_shape():
+    src = torch.arange(48, dtype=torch.float32, device=flag_gems.device).reshape(4, 12)
+    src = src[:, ::2]
+    dst = torch.empty((4, 6), dtype=torch.float32, device=flag_gems.device)
+    ref_src = utils.to_reference(src)
+    ref_dst = torch.empty_like(ref_src)
+    ref_dst.copy_(ref_src)
+
+    assert not src.is_contiguous()
+    with flag_gems.use_gems():
+        dst.copy_(src)
+
+    utils.gems_assert_equal(dst, ref_dst)
