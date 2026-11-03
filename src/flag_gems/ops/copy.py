@@ -141,7 +141,9 @@ def copy_(dst: torch.Tensor, src: torch.Tensor, non_blocking: bool = False):
         and src.is_contiguous()
     ):
         n = dst.numel()
-        _copy_contiguous_kernel[(triton.cdiv(n, 1024),)](dst, src, n, BLOCK=1024)
+        _copy_contiguous_kernel[(triton.cdiv(n, 256),)](
+            dst, src, n, BLOCK=256, num_warps=2
+        )
         return dst
 
     try:
