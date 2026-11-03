@@ -1569,6 +1569,7 @@ class LibEntry(triton.KernelInterface):
         ]
         self.lock = multiprocessing.Lock()
         self.signature = fn.signature
+        self.param_names = tuple(self.signature.parameters)
 
     @staticmethod
     def _contains_flagtune_tuner(fn):
@@ -1600,32 +1601,35 @@ class LibEntry(triton.KernelInterface):
             for cache in self.kernel_cache:
                 cache.clear()
 
+    def _spec_arg(self, arg):
+        if hasattr(arg, "data_ptr"):
+            if device.vendor_name == "hygon" and hasattr(triton.backends, "hcu"):
+                from triton.backends.hcu.compiler import HIPBackend
+
+                if hasattr(HIPBackend, "get_tensor_specialization"):
+                    return (
+                        arg.dtype,
+                        arg.data_ptr() % self.divisibility == 0,
+                        HIPBackend.get_tensor_specialization(arg),
+                    )
+            return (arg.dtype, arg.data_ptr() % self.divisibility == 0)
+        return (type(arg), arg)
+
+    @staticmethod
+    def _dns_arg(arg):
+        if hasattr(arg, "data_ptr"):
+            return arg.dtype
+        if not isinstance(arg, int):
+            return type(arg)
+        if -(2**31) <= arg and arg <= 2**31 - 1:
+            return "i32"
+        if 2**63 <= arg and arg <= 2**64 - 1:
+            return "u64"
+        return "i64"
+
     def key(self, spec_args, dns_args, const_args):
-        def spec_arg(arg):
-            if hasattr(arg, "data_ptr"):
-                if device.vendor_name == "hygon" and hasattr(triton.backends, "hcu"):
-                    from triton.backends.hcu.compiler import HIPBackend
-
-                    if hasattr(HIPBackend, "get_tensor_specialization"):
-                        return (
-                            arg.dtype,
-                            arg.data_ptr() % self.divisibility == 0,
-                            HIPBackend.get_tensor_specialization(arg),
-                        )
-                return (arg.dtype, arg.data_ptr() % self.divisibility == 0)
-            return (type(arg), arg)
-
-        def dns_arg(arg):
-            if hasattr(arg, "data_ptr"):
-                return arg.dtype
-            if not isinstance(arg, int):
-                return type(arg)
-            if -(2**31) <= arg and arg <= 2**31 - 1:
-                return "i32"
-            if 2**63 <= arg and arg <= 2**64 - 1:
-                return "u64"
-            return "i64"
-
+        spec_arg = self._spec_arg
+        dns_arg = self._dns_arg
         spec_key = [spec_arg(arg) for arg in spec_args]
         dns_key = [dns_arg(arg) for arg in dns_args]
         # const args passed by position
@@ -1640,14 +1644,11 @@ class LibEntry(triton.KernelInterface):
         spec_args = []  # specialize arguments
         dns_args = []  # do not specialize arguments
         const_args = []  # constexpr arguments
-        k_args = OrderedDict()
-        param_names = list(self.signature.parameters.keys())
+        k_args = {}
+        param_names = self.param_names
         for i, arg in enumerate(args):
             hashable_arg = arg
-            if (
-                hasattr(arg, "__class__")
-                and arg.__class__.__name__ == "TensorDescriptor"
-            ):
+            if arg.__class__.__name__ == "TensorDescriptor":
                 # Create a hashable representation of TensorDescriptor
                 hashable_arg = (
                     "TensorDescriptor",
@@ -1702,7 +1703,8 @@ class LibEntry(triton.KernelInterface):
             cache = self._cpu_cache
         else:
             cache = self.kernel_cache[device]
-        while entry_key not in cache:
+        cached = cache.get(entry_key)
+        while cached is None:
             # NOTE: we serialize the first run of a jit function regardless of which device to run on
             # because Triton runtime is currently not threadsafe.
             with self.lock:
@@ -1762,7 +1764,7 @@ class LibEntry(triton.KernelInterface):
             tune_constexprs,
             heur_constexprs,
             launch_pre_hooks,
-        ) = cache[entry_key]
+        ) = cache[entry_key] if cached is None else cached
 
         if callable(grid):
             # collect all arguments to the grid fn，ie:
@@ -1770,19 +1772,22 @@ class LibEntry(triton.KernelInterface):
             # 2. kwargs,
             # 3. all all other captured arguments in CompiledKernel from Autotunner & Heuristics
             # when kwargs & captured args conflict, captured args have higher priority
-            meta = {**dict(zip(self.arg_names, args)), **kwargs, **constexprs}
+            meta = dict(zip(self.arg_names, args))
+            meta.update(kwargs)
+            meta.update(constexprs)
             grid = grid(meta)
         grid = grid + (1, 1)
 
         if launch_pre_hooks:
-            hook_nargs = {**dict(zip(self.arg_names, args)), **kwargs}
+            hook_nargs = dict(zip(self.arg_names, args))
+            hook_nargs.update(kwargs)
             for pre_hook, hook_kwargs in launch_pre_hooks:
                 pre_hook({**hook_nargs, **hook_kwargs})
 
         if major_version == 3 and 3 <= minor_version <= 6:
             all_args = []
             missing_keys = []
-            for key in list(self.signature.parameters.keys()):
+            for key in self.param_names:
                 if key in k_args:
                     all_args.append(k_args[key])
                 elif key in tune_constexprs:
