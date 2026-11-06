@@ -50,4 +50,6 @@ def test_tile_packed_weights_are_cached_once():
     assert gate_first is gate_second
     assert up_first is up_second
     assert gate_first.shape == (1, 2, 32, 128)
+    assert torch.equal(gate_first[0, 0], b[:, :128])
+    assert torch.equal(up_first[0, 0], b[:, 128:256])
     assert len(_TILE_PACKED) == 1
