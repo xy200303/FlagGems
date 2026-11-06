@@ -72,7 +72,7 @@ def _tile_packed_silu_mul_kernel(
     ram = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)
     rk = tl.arange(0, BLOCK_K)
     rn_local = tl.arange(0, BLOCK_N)
-    tile_offsets = rn_local[:, None] * BLOCK_K + rk[None, :]
+    tile_offsets = rk[:, None] + rn_local[None, :] * BLOCK_K
     a_ptrs = A + ram[:, None] * stride_am + rk[None, :] * stride_ak
     gate_ptrs = GATE + pid_n * BLOCK_K * BLOCK_N + tile_offsets
     up_ptrs = UP + pid_n * BLOCK_K * BLOCK_N + tile_offsets
