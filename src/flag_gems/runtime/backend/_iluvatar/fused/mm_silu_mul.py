@@ -98,7 +98,7 @@ _TILE_PACKED = {}
 
 def _tile_pack_slice(x):
     k, n = x.shape
-    return x.t().contiguous().view(k // 32, 32, n // 128, 128).permute(
+    return x.contiguous().view(k // 32, 32, n // 128, 128).permute(
         0, 2, 1, 3
     ).contiguous()
 
