@@ -63,7 +63,7 @@ def mm_silu_mul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     N = b.shape[1] // 2
     out = torch.empty((M, N), dtype=a.dtype, device=a.device)
     if M <= 128:
-        block_m, warps, stages = 64, 8, 2
+        block_m, warps, stages = 64, 16, 2
     else:
         block_m, warps, stages = 256, 8, 2
     grid = (triton.cdiv(M, block_m) * triton.cdiv(N, 128),)
