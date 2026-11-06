@@ -88,8 +88,8 @@ def _tile_packed_silu_mul_kernel(
         gate_ptrs += grid_n * BLOCK_K * BLOCK_N
         up_ptrs += grid_n * BLOCK_K * BLOCK_N
     result = gate_acc * tl.sigmoid(gate_acc) * up_acc
-    c_ptrs = C + rm[:, None] * stride_cm + rn_local[None, :] * stride_cn
-    mask = (rm < M)[:, None] & (rn_local < N)[None, :]
+    c_ptrs = C + rm[:, None] * stride_cm + rn[None, :] * stride_cn
+    mask = (rm < M)[:, None] & (rn < N)[None, :]
     tl.store(c_ptrs, result.to(C.dtype.element_ty), mask=mask)
 
 
