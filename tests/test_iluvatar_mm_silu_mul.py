@@ -17,7 +17,11 @@ import torch
 import torch.nn.functional as F
 
 import flag_gems
-from flag_gems.runtime.backend._iluvatar.fused.mm_silu_mul import mm_silu_mul
+from flag_gems.runtime.backend._iluvatar.fused.mm_silu_mul import (
+    _TILE_PACKED,
+    _tile_packed_weights,
+    mm_silu_mul,
+)
 
 
 @pytest.mark.skipif(flag_gems.vendor_name != "iluvatar", reason="Iluvatar only")
@@ -34,3 +38,16 @@ def test_mm_silu_mul_matches_unfused_reference(M):
     assert result.shape == (M, N)
     assert torch.isfinite(result).all()
     torch.testing.assert_close(result, reference, rtol=0.05, atol=0.05)
+
+
+def test_tile_packed_weights_are_cached_once():
+    _TILE_PACKED.clear()
+    b = torch.randn(32, 512, dtype=torch.bfloat16)
+
+    gate_first, up_first = _tile_packed_weights(b)
+    gate_second, up_second = _tile_packed_weights(b)
+
+    assert gate_first is gate_second
+    assert up_first is up_second
+    assert gate_first.shape == (1, 2, 32, 128)
+    assert len(_TILE_PACKED) == 1
