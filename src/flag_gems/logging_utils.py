@@ -25,6 +25,7 @@ Notes
 """
 
 import logging
+import os
 import traceback
 from pathlib import Path
 
@@ -42,6 +43,13 @@ class LogOncePerLocationFilter(logging.Filter):
             return False
         self.logged_locations.add(key)
         return True
+
+
+def configure_default_logging():
+    level = os.getenv("FLAGGEMS_LOG_LEVEL", "INFO").upper()
+    logging.getLogger("flag_gems").setLevel(
+        logging.DEBUG if level == "DEBUG" else logging.INFO
+    )
 
 
 def _remove_file_handlers(logger: logging.Logger):

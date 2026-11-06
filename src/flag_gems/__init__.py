@@ -18,6 +18,10 @@ import warnings
 import torch
 from packaging import version
 
+from flag_gems.logging_utils import configure_default_logging
+
+configure_default_logging()
+
 from flag_gems import testing  # noqa: F401
 from flag_gems import runtime
 from flag_gems.config import aten_patch_list, resolve_user_setting
